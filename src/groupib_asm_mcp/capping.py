@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-MAX_RESULT_CHARS = 60_000
+MAX_RESULT_CHARS = 30_000
 MIN_RESULT_CHARS = 10_000  # smaller limits leave no room for the ``truncated`` object
 
 # Room reserved for the ``truncated`` object itself, so adding it cannot push a result over.
@@ -35,12 +35,12 @@ _CURSOR_KEYS = ("seqUpdate",)
 
 
 def dump(data: Any) -> str:
-    """Serialize as compact JSON, the exact text a tool result carries."""
-    return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+    """Serialize as compact ASCII JSON, so character counts equal UTF-8 byte counts."""
+    return json.dumps(data, separators=(",", ":"), ensure_ascii=True)
 
 
 def cap_result(data: Any, limit: int = MAX_RESULT_CHARS) -> str:
-    """Serialize ``data`` to compact JSON of at most ``limit`` characters."""
+    """Serialize ``data`` to compact JSON of at most ``limit`` ASCII bytes."""
     text = dump(data)
     if len(text) <= limit:
         return text

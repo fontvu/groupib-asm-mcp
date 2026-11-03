@@ -9,6 +9,53 @@ def test_small_payload_is_returned_unchanged():
     assert json.loads(cap_result(data)) == data
 
 
+def test_multilingual_payload_roundtrips_as_ascii_json():
+    data = {"名称": "café 漢字 😀", "items": [{"id": "名😀"}]}
+
+    text = cap_result(data)
+
+    assert text.isascii()
+    assert len(text) == len(text.encode("utf-8"))
+    assert json.loads(text) == data
+
+
+def test_oversized_multilingual_page_fits_byte_budget_without_corrupting_records():
+    items = [{"id": i, "名称": "漢字é😀" * 20} for i in range(200)]
+    data = {"count": "200 of 200", "items": items, "seqUpdate": 9}
+    # The old character-based, non-ASCII serialization fit its 60k character limit while
+    # exceeding the host's approximately 40 KB limit on UTF-8 bytes.
+    old_text = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+    assert len(old_text) < 60_000
+    assert len(old_text.encode("utf-8")) > 40_000
+
+    for text, limit in ((cap_result(data), 30_000), (cap_result(data, limit=10_000), 10_000)):
+        assert text.isascii()
+        assert len(text) == len(text.encode("utf-8")) <= limit
+        result = json.loads(text)
+        kept = len(result["items"])
+        assert 0 < kept < len(items)
+        assert result["items"] == items[:kept]
+        assert result["truncated"]["lists"] == {
+            "items": {"returned": kept, "available": len(items)}
+        }
+        assert "seqUpdate" not in result
+
+
+def test_oversized_multilingual_field_reports_omission():
+    value = "漢字é😀" * 10_000
+    data = {"items": [{"id": "名😀", "description": value}], "seqUpdate": 9}
+
+    text = cap_result(data)
+
+    assert text.isascii()
+    assert len(text.encode("utf-8")) <= 30_000
+    result = json.loads(text)
+    size = len(dump(value))
+    assert result["items"] == [{"id": "名😀", "description": f"<omitted: {size} chars>"}]
+    assert result["truncated"]["omitted"] == [{"path": "items[0].description", "chars": size}]
+    assert result["seqUpdate"] == 9
+
+
 def test_long_list_is_cut_to_the_largest_fitting_prefix_and_cursor_is_dropped():
     items = [{"id": i, "pad": "x" * 100} for i in range(1000)]
     data = {"count": "1000 of 1000", "items": items, "seqUpdate": 9}

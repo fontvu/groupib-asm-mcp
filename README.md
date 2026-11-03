@@ -18,7 +18,7 @@ your SSO password and shows the key once).
 export GIB_ASM_LOGIN='you@example.com'
 export GIB_ASM_API_KEY='...'          # never commit this
 # optional: GIB_ASM_BASE_URL (default https://asm.group-ib.com)
-# optional: GIB_ASM_MAX_RESULT_CHARS (default 60000)
+# optional: GIB_ASM_MAX_RESULT_CHARS (default 30000)
 ```
 
 The server refuses to start if either variable is missing.
@@ -65,10 +65,15 @@ In issue results the top-level `status` is the lifecycle state (`Detected`, `Und
 `Solved`, `Manually solved`, `Ignored`, `False positive`) and `body.status` is the severity label
 (`Critical severity`, ...). `Manually solved` appears in live data but not in the Swagger enum.
 
+`list_assets` also supports `type=["typosq"]` for lookalike domains. The API's
+`filter_string` is a free-text search, not an exact asset-name filter; results can match
+discovery paths or other fields. Check each returned asset and its attribution.
+
 ## Result size and paging
 
-Every tool result is kept under 60,000 characters (`GIB_ASM_MAX_RESULT_CHARS`, minimum 10000) as
-compact JSON, so one call cannot flood the model's context.
+Every tool result is kept under 30,000 ASCII bytes (`GIB_ASM_MAX_RESULT_CHARS`, minimum 10000)
+as valid compact JSON. Unicode round-trips through JSON escapes. The default avoids truncation
+by hosts with smaller output limits; raising it may cause a host to truncate the result.
 
 - **Paged queries** (`list_issues`, `list_assets`, `list_leaks`): if a page is too big, the same
   request is repeated with a smaller `count`, so nothing is dropped and the returned `seqUpdate`
@@ -82,6 +87,11 @@ compact JSON, so one call cannot flood the model's context.
   and sizes. The remaining fields are returned intact, and records are never dropped or replaced
   as a whole. Fetch an omitted record on its own (e.g. `get_issue_evidence`) or raise
   `GIB_ASM_MAX_RESULT_CHARS` to see the full field.
+
+Read-only requests that receive HTTP 429 are retried up to three times with backoff. A valid
+`Retry-After` is respected; if it exceeds the maximum 30-second retry delay or the remaining
+operation deadline, the call returns an explicit error rather than retrying early. Each tool
+call has a 60-second overall deadline including retries and page refetches.
 
 ## Development
 
