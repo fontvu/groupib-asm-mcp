@@ -1,11 +1,22 @@
 # groupib-asm-mcp
 
-Read-only [MCP](https://modelcontextprotocol.io) server for the Group-IB **Attack Surface
-Management** REST API (`https://asm.group-ib.com`, API version 2.9.3).
+[MCP](https://modelcontextprotocol.io) server for the Group-IB **Attack Surface Management**
+REST API (`https://asm.group-ib.com`, API version 2.9.3). It wraps all 28 operations in the
+bundled API specification, including writes. The current API specification is available at
+`/api/doc/swagger.json` after signing in to ASM.
 
-Only endpoints that read data are exposed. Creating clients/companies/users, changing issue or
-asset status/severity, comments, and adding/removing assets are **not** wrapped. The full API
-spec is available at `/api/doc/swagger.json` after signing in to ASM.
+Write tools require interactive approval of the exact destination, endpoint and complete JSON
+body. MCP clients that support form elicitation receive a standard approval request; OMP uses
+the extension below. A rejected, unavailable, cancelled or expired approval sends no request.
+Requests whose JSON body exceeds 16,000 characters are rejected instead of showing an
+incomplete approval preview. Client implementations decide how to handle MCP elicitation, so
+use one that presents it to a human.
+
+OMP's approval extension serializes each review, decision, and callback. It opens a scrollable
+review followed by an **Approve once / Deny** question; both display the same request ID. Review
+the whole request and submit it unchanged before answering. OMP must run interactively with an
+extension-capable UI; headless sessions fail closed. Approval expires after 60 seconds, including
+time spent waiting behind another request.
 
 ## Credentials
 
@@ -46,6 +57,20 @@ your checkout:
 
 Restart omp after exporting the variables.
 
+To install the OMP confirmation extension for the default profile, create a symlink to the
+checked-out extension and restart OMP (existing sessions do not load new extensions):
+
+```sh
+mkdir -p ~/.omp/agent/extensions
+ln -s /absolute/path/to/groupib-asm/omp/groupib-asm-approval.ts \
+  ~/.omp/agent/extensions/groupib-asm-approval.ts
+```
+
+The extension and MCP server must run as the same local user and share a temporary directory;
+do not use the bridge for a remote MCP server. It communicates the answer over a private,
+single-use local socket; it never sends credentials to OMP. If the extension or UI is absent,
+the write is refused after the approval deadline.
+
 ## Tools
 
 | Tool | API |
@@ -60,6 +85,14 @@ Restart omp after exporting the variables.
 | `list_leaks` | `POST /api/v1/leaks/updated` |
 | `list_reports`, `get_last_report`, `get_report` | `GET /api/v1/reports/...` |
 | `get_company_logs`, `get_user_logs` | `POST /api/v1/companies/logs`, `POST /api/v1/users/logs` |
+| `create_client` | `POST /api/v1/clients/create` |
+| `create_company`, `create_companies_bulk`, `update_company` | `POST /api/v1/companies/create`, `POST .../create/bulk`, `POST .../update` |
+| `create_user` | `POST /api/v1/users/create` |
+| `change_issue_status`, `change_issue_severity`, `add_issue_comment` | `POST /api/v1/issues/status/change`, `POST .../severity/change`, `POST .../comments/add` |
+| `add_company_indicators`, `remove_company_indicators`, `change_asset_status` | `POST /api/v1/assets/add`, `POST .../remove`, `POST .../status/change` |
+
+For issue status changes, the API accepts case-sensitive values (`Detected`, `Under review`,
+`Solved`, `False positive`, `Ignored`), unlike the lowercase values used when filtering issues.
 
 In issue results the top-level `status` is the lifecycle state (`Detected`, `Under review`,
 `Solved`, `Manually solved`, `Ignored`, `False positive`) and `body.status` is the severity label
@@ -68,6 +101,12 @@ In issue results the top-level `status` is the lifecycle state (`Detected`, `Und
 `list_assets` also supports `type=["typosq"]` for lookalike domains. The API's
 `filter_string` is a free-text search, not an exact asset-name filter; results can match
 discovery paths or other fields. Check each returned asset and its attribution.
+
+An automatically discovered asset or a shared WHOIS address or IP is a lead, not proof of
+ownership or responsibility. Review the full discovery path against authoritative inventory before
+confirming an asset or classifying a finding. Leaked-credential evidence can contain duplicate or
+misparsed fields; validate and deduplicate actual accounts before relying on record counts. A
+false attribution to one company does not by itself invalidate the underlying security finding.
 
 ## Result size and paging
 
@@ -93,9 +132,15 @@ Read-only requests that receive HTTP 429 are retried up to three times with back
 operation deadline, the call returns an explicit error rather than retrying early. Each tool
 call has a 60-second overall deadline including retries and page refetches.
 
+Write requests are sent **once**, never automatically retried. A timeout, transport error,
+non-JSON response, or unsuccessful HTTP response may leave the outcome uncertain: check ASM's
+state before attempting the change again. Writes can create users, change scan settings, or
+alter issue and asset classifications; verify the requested values before approving.
+
 ## Development
 
 ```sh
 uv run pytest
+node --test tests/test_omp_extension.mjs  # Node.js 22.6+ with native TypeScript stripping
 uv run ruff check . && uv run ruff format --check .
 ```

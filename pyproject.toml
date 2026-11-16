@@ -1,7 +1,7 @@
 [project]
 name = "groupib-asm-mcp"
 version = "0.1.0"
-description = "Read-only MCP server for the Group-IB Attack Surface Management REST API"
+description = "MCP server for the Group-IB Attack Surface Management REST API"
 readme = "README.md"
 authors = [
     { name = "Phong Vu", email = "13135095+fontvu@users.noreply.github.com" }

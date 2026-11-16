@@ -109,6 +109,17 @@ class AsmClient:
             transport=transport,
         )
 
+    @property
+    def base_url(self) -> str:
+        """Return the actual request destination, without exposing URL credentials."""
+        url = self._http.base_url
+        if url.userinfo or url.query or url.fragment:
+            raise AsmError(
+                "Approval is unavailable for a base URL containing credentials, a query, "
+                "or a fragment."
+            )
+        return str(url)
+
     async def get(self, path: str, params: dict[str, Any] | None = None) -> str:
         async with self._operation("GET", path) as deadline:
             data = await self._fetch("GET", path, deadline, params=_drop_none(params or {}))
@@ -118,6 +129,29 @@ class AsmClient:
         async with self._operation("POST", path) as deadline:
             data = await self._fetch("POST", path, deadline, json=_drop_none(body))
             return cap_result(data, self._max_chars)
+
+    async def mutate(self, path: str, body: dict[str, Any]) -> str:
+        """Send one write request without retrying an uncertain outcome."""
+        uncertain = "The write may have been applied; check its state before taking further action."
+        try:
+            async with asyncio.timeout(self._timeout):
+                response = await self._http.post(path, json=_drop_none(body))
+        except TimeoutError:
+            raise AsmError(f"Write operation timed out. {uncertain}") from None
+        except httpx.HTTPError as exc:
+            # Do not expose exception text, request details or server-provided error bodies:
+            # they may contain credentials or other sensitive request values.
+            raise AsmError(f"Write operation failed ({type(exc).__name__}). {uncertain}") from None
+
+        if not response.is_success:
+            raise AsmError(f"Write returned HTTP {response.status_code}. {uncertain}")
+        if not response.content:
+            return cap_result(None, self._max_chars)
+        try:
+            data = response.json()
+        except ValueError:
+            raise AsmError(f"Write returned a non-JSON response. {uncertain}") from None
+        return cap_result(data, self._max_chars)
 
     async def post_paged(self, path: str, body: dict[str, Any]) -> str:
         """POST a ``seqUpdate``-paged list query without ever dropping items from a page.

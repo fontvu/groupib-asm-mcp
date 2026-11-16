@@ -1,23 +1,199 @@
-"""MCP server exposing the read-only part of the Group-IB ASM REST API.
-
-Only endpoints that read data are wrapped. The write endpoints in the API (creating clients,
-companies and users, changing issue/asset status or severity, comments, adding or removing
-assets) are deliberately not exposed.
-"""
+"""MCP server exposing the Group-IB ASM REST API."""
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+import secrets
+import socket
+import tempfile
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from groupib_asm_mcp.capping import MAX_RESULT_CHARS, MIN_RESULT_CHARS
 from groupib_asm_mcp.client import DEFAULT_BASE_URL, AsmClient, AsmError, path_segment
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=True)
+WRITE = ToolAnnotations(
+    read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True
+)
+DESTRUCTIVE_WRITE = ToolAnnotations(
+    read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True
+)
+
+LicenseType = Literal[
+    "asm",
+    "cspm",
+    "asm_cspm",
+    "3rd_party",
+    "attack surface management",
+    "third party risk management",
+]
+WriteIssueStatus = Literal["Detected", "Under review", "Solved", "False positive", "Ignored"]
+
+
+class Approval(BaseModel):
+    approve: StrictBool = Field(description="Approve this exact API request")
+
+
+class CreateCompany(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    clientId: str
+    root: str
+    name: str
+    licenseType: LicenseType | None = None
+    activeScan: bool | None = None
+    branch: list[str] | None = None
+    subAsRoot: bool | None = None
+
+
+class AutoFiltering(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: list[str] | None = None
+    ignore: list[str] | None = None
+
+
+_APPROVAL_TIMEOUT = 60.0
+_MAX_APPROVAL_RESPONSE_BYTES = 4096
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON key")
+        result[key] = value
+    return result
+
+
+async def _omp_approval(session: Any, path: str, body: dict[str, Any], base_url: str) -> bool:
+    """Request a single-use approval over a private, deadline-bound local socket."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _APPROVAL_TIMEOUT
+    token = secrets.token_hex(32)
+    try:
+        async with asyncio.timeout_at(deadline):
+            with tempfile.TemporaryDirectory(prefix="groupib-asm-approval-") as directory:
+                socket_path = str(Path(directory) / "approval.sock")
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                    os.chmod(directory, 0o700)
+                    listener.setblocking(False)
+                    listener.bind(socket_path)
+                    listener.listen(1)
+                    await session.send_log_message(
+                        level="notice",
+                        logger="groupib-asm.approval",
+                        data={
+                            "version": 1,
+                            "socket": socket_path,
+                            "token": token,
+                            "path": path,
+                            "body": body,
+                            "base_url": base_url,
+                        },
+                    )
+                    connection, _ = await loop.sock_accept(listener)
+                    # No second connection can obtain or reuse this approval.
+                    listener.close()
+                    with connection:
+                        connection.setblocking(False)
+                        response = bytearray()
+                        while len(response) <= _MAX_APPROVAL_RESPONSE_BYTES:
+                            chunk = await loop.sock_recv(
+                                connection, _MAX_APPROVAL_RESPONSE_BYTES + 1 - len(response)
+                            )
+                            if not chunk:
+                                break
+                            response.extend(chunk)
+                        if (
+                            len(response) > _MAX_APPROVAL_RESPONSE_BYTES
+                            or not response.endswith(b"\n")
+                            or response.count(b"\n") != 1
+                        ):
+                            return False
+                        try:
+                            payload = json.loads(
+                                response.decode("utf-8"), object_pairs_hook=_unique_object
+                            )
+                        except (ValueError, TypeError, RecursionError):
+                            return False
+                        if (
+                            not isinstance(payload, dict)
+                            or set(payload) != {"token", "approved"}
+                            or not isinstance(payload["token"], str)
+                            or not payload["token"].isascii()
+                            or type(payload["approved"]) is not bool
+                        ):
+                            return False
+                        approved = (
+                            secrets.compare_digest(payload["token"], token)
+                            and payload["approved"] is True
+                        )
+                        if loop.time() >= deadline:
+                            raise TimeoutError
+                        return approved
+    except TimeoutError:
+        raise ToolError("Interactive approval timed out; no request was sent.") from None
+    except Exception:
+        raise ToolError("Interactive approval is unavailable; no request was sent.") from None
+
+
+async def _mutate_with_approval(
+    client: AsmClient, ctx: Context, path: str, body: dict[str, Any]
+) -> Any:
+    """Show the complete request and fail closed unless explicitly approved."""
+    # Freeze the actual JSON body for both display and the request, matching mutate's
+    # removal of top-level nulls even if a caller passes them directly.
+    preview = json.dumps(
+        {key: value for key, value in body.items() if value is not None},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    if len(preview) > 16000:
+        raise ToolError("Write request is too large to display in full for approval.")
+    body = json.loads(preview)
+    base_url = client.base_url
+    try:
+        session = ctx.request_context.session
+        capabilities = session.client_capabilities
+        elicitation = capabilities.elicitation if capabilities is not None else None
+        supports_form = elicitation is not None and (
+            elicitation.form is not None or elicitation.url is None
+        )
+    except (AttributeError, ValueError) as exc:
+        raise ToolError("Interactive approval is unavailable; no request was sent.") from exc
+    if supports_form:
+        try:
+            result = await ctx.elicit(
+                f"Approve this Group-IB ASM write request?\nBase URL: {base_url}\n"
+                f"POST {path}\nJSON body: {preview}",
+                Approval,
+            )
+        except Exception as exc:
+            raise ToolError("Interactive approval is unavailable; no request was sent.") from exc
+        approved = (
+            getattr(result, "action", None) == "accept"
+            and isinstance(getattr(result, "data", None), Approval)
+            and result.data.approve is True
+        )
+    else:
+        approved = await _omp_approval(session, path, json.loads(preview), base_url)
+    if not approved:
+        raise ToolError("Write request was not approved; no request was sent.")
+    return await client.mutate(path, body)
+
+
+def _optional(**values: Any) -> dict[str, Any]:
+    return {key: value for key, value in values.items() if value is not None}
+
 
 IssueStatus = Literal["detected", "under review", "solved", "ignored", "false positive"]
 Severity = Literal["crit", "high", "medium", "low"]
@@ -44,8 +220,10 @@ Cursor = Annotated[
 Count = Annotated[int | None, Field(ge=1, description="Page size (API default is 10)")]
 
 INSTRUCTIONS = (
-    "Read-only access to Group-IB Attack Surface Management. Start with list_companies to find "
-    "a company id, then query its issues, assets, scores and reports. In issue results the "
+    "Access to Group-IB Attack Surface Management. Write tools require interactive approval "
+    "of the exact request and fail closed when interactive approval is unavailable. Start with "
+    "list_companies to find a company id, then query its issues, assets, scores and reports. "
+    "In issue results the "
     "top-level `status` is the lifecycle state (Detected, Under review, Solved, Manually solved, "
     "Ignored, False positive) while `body.status` is "
     "the severity label (e.g. 'Critical severity')."
@@ -323,5 +501,184 @@ def create_server(client: AsmClient) -> MCPServer:
     async def get_user_logs(date_from: DateFrom = None, date_to: DateTo = None) -> Any:
         """Get the log of user actions within an optional date window."""
         return await client.post("/api/v1/users/logs", {"dateFrom": date_from, "dateTo": date_to})
+
+    # ---- writes: each request requires interactive approval -----------------------------
+
+    @mcp.tool(annotations=WRITE)
+    async def create_client(
+        name: str,
+        country: str,
+        ctx: Context,
+        partner_id: str | None = None,
+        industry: str | None = None,
+        manager_id: str | None = None,
+    ) -> Any:
+        """Create a client; optional values are omitted unless supplied."""
+        body = {
+            "name": name,
+            "country": country,
+            **_optional(partnerId=partner_id, industry=industry, managerId=manager_id),
+        }
+        return await _mutate_with_approval(client, ctx, "/api/v1/clients/create", body)
+
+    @mcp.tool(annotations=WRITE)
+    async def create_company(
+        client_id: str,
+        root: str,
+        name: str,
+        ctx: Context,
+        license_type: LicenseType | None = None,
+        active_scan: bool | None = None,
+        branch: list[str] | None = None,
+        sub_as_root: bool | None = None,
+    ) -> Any:
+        """Create one company for a client."""
+        body = {
+            "clientId": client_id,
+            "root": root,
+            "name": name,
+            **_optional(
+                licenseType=license_type,
+                activeScan=active_scan,
+                branch=branch,
+                subAsRoot=sub_as_root,
+            ),
+        }
+        return await _mutate_with_approval(client, ctx, "/api/v1/companies/create", body)
+
+    @mcp.tool(annotations=WRITE)
+    async def create_companies_bulk(companies: list[CreateCompany], ctx: Context) -> Any:
+        """Create companies in bulk using the API's company field names."""
+        body = {"companies": [company.model_dump(exclude_none=True) for company in companies]}
+        return await _mutate_with_approval(client, ctx, "/api/v1/companies/create/bulk", body)
+
+    @mcp.tool(annotations=DESTRUCTIVE_WRITE)
+    async def update_company(
+        company_id: CompanyId,
+        ctx: Context,
+        branches: str | None = None,
+        name: str | None = None,
+        website: str | None = None,
+        root_indicator: str | None = None,
+        use_only_confirmed_assets: bool | None = None,
+        use_auto_resolving_cloud_assets: bool | None = None,
+        auto_filtering: AutoFiltering | None = None,
+    ) -> Any:
+        """Update company settings, including optional auto-filtering rules."""
+        body = {
+            "companyId": company_id,
+            **_optional(
+                branches=branches,
+                name=name,
+                website=website,
+                rootIndicator=root_indicator,
+                useOnlyConfirmedAssets=use_only_confirmed_assets,
+                useAutoResolvingCloudAssets=use_auto_resolving_cloud_assets,
+                autoFiltering=auto_filtering.model_dump(exclude_none=True)
+                if auto_filtering is not None
+                else None,
+            ),
+        }
+        return await _mutate_with_approval(client, ctx, "/api/v1/companies/update", body)
+
+    @mcp.tool(annotations=WRITE)
+    async def create_user(
+        name: str,
+        email: str,
+        role: Literal["user", "admin", "read only"],
+        access_type: Literal["client", "partner"],
+        ctx: Context,
+        client_id: str | None = None,
+        partner_id: str | None = None,
+    ) -> Any:
+        """Create an ASM user with the specified role and access type."""
+        body = {
+            "name": name,
+            "email": email,
+            "role": role,
+            "accessType": access_type,
+            **_optional(clientId=client_id, partnerId=partner_id),
+        }
+        return await _mutate_with_approval(client, ctx, "/api/v1/users/create", body)
+
+    @mcp.tool(annotations=DESTRUCTIVE_WRITE)
+    async def change_issue_status(
+        issues_id: list[str], status: WriteIssueStatus, ctx: Context
+    ) -> Any:
+        """Change issue lifecycle status; status values are case-sensitive."""
+        return await _mutate_with_approval(
+            client, ctx, "/api/v1/issues/status/change", {"issuesId": issues_id, "status": status}
+        )
+
+    @mcp.tool(annotations=DESTRUCTIVE_WRITE)
+    async def change_issue_severity(issues_id: list[str], severity: Severity, ctx: Context) -> Any:
+        """Manually set issue severity, overriding automatic rescoring."""
+        return await _mutate_with_approval(
+            client,
+            ctx,
+            "/api/v1/issues/severity/change",
+            {"issuesId": issues_id, "severity": severity},
+        )
+
+    @mcp.tool(annotations=WRITE)
+    async def add_issue_comment(
+        company_id: CompanyId, issue_id: str, body: str, ctx: Context
+    ) -> Any:
+        """Add a comment to an issue."""
+        return await _mutate_with_approval(
+            client,
+            ctx,
+            "/api/v1/issues/comments/add",
+            {"companyId": company_id, "issueId": issue_id, "body": body},
+        )
+
+    @mcp.tool(annotations=WRITE)
+    async def add_company_indicators(
+        company_id: CompanyId,
+        ctx: Context,
+        confirmed_domain: list[str] | None = None,
+        excluded_domain: list[str] | None = None,
+        confirmed_ip: list[str] | None = None,
+        excluded_ip: list[str] | None = None,
+    ) -> Any:
+        """Add confirmed or excluded domain and IP indicators to a company."""
+        body = {
+            "companyId": company_id,
+            **_optional(
+                confirmedDomain=confirmed_domain,
+                excludedDomain=excluded_domain,
+                confirmedIP=confirmed_ip,
+                excludedIP=excluded_ip,
+            ),
+        }
+        return await _mutate_with_approval(client, ctx, "/api/v1/assets/add", body)
+
+    @mcp.tool(annotations=DESTRUCTIVE_WRITE)
+    async def remove_company_indicators(
+        company_id: CompanyId,
+        ctx: Context,
+        confirmed_domain: list[str] | None = None,
+        excluded_domain: list[str] | None = None,
+        confirmed_ip: list[str] | None = None,
+        excluded_ip: list[str] | None = None,
+    ) -> Any:
+        """Remove confirmed or excluded domain and IP indicators from a company."""
+        body = {
+            "companyId": company_id,
+            **_optional(
+                confirmedDomain=confirmed_domain,
+                excludedDomain=excluded_domain,
+                confirmedIP=confirmed_ip,
+                excludedIP=excluded_ip,
+            ),
+        }
+        return await _mutate_with_approval(client, ctx, "/api/v1/assets/remove", body)
+
+    @mcp.tool(annotations=DESTRUCTIVE_WRITE)
+    async def change_asset_status(assets_id: list[str], status: AssetStatus, ctx: Context) -> Any:
+        """Change the status of assets by ID."""
+        return await _mutate_with_approval(
+            client, ctx, "/api/v1/assets/status/change", {"assetsId": assets_id, "status": status}
+        )
 
     return mcp
