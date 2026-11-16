@@ -141,14 +141,21 @@ In issue results the top-level `status` is the lifecycle state (`Detected`, `Und
 `Solved`, `Manually solved`, `Ignored`, `False positive`) and `body.status` is the severity label
 (`Critical severity`, ...). `Manually solved` appears in live data but not in the Swagger enum.
 
-`list_issues` defaults `date_from` to `1970-01-01` to avoid the API's implicit recent
-date window, which can hide older findings even when their status is under review. Set
-`date_from` explicitly to narrow the window; API date limits and retention still apply.
+`list_issues`, `list_assets` and `list_leaks` default `date_from` to `1970-01-01` to avoid the
+API's implicit recent date window, which can hide older findings even when their status is under
+review, and which silently returns only the newest slice of the asset inventory. Set `date_from`
+explicitly to narrow the window; API date limits and retention still apply.
 Other paged tools retain their API date defaults.
 
 `list_assets` also supports `type=["typosq"]` for lookalike domains. The API's
 `filter_string` is a free-text search, not an exact asset-name filter; results can match
 discovery paths or other fields. Check each returned asset and its attribution.
+
+`type`, `status`, `discover` and `has_issues` are array parameters and must be passed as JSON
+arrays (`["domain"]`, `["new"]`); the server rejects a bare string or a single-key object for
+them. Some MCP clients re-wrap a single-element array as an object (`{"item": "domain"}`) before
+the call reaches the server, which the schema boundary rejects — pass the array as a real JSON
+array so the client forwards it unchanged.
 
 An automatically discovered asset or a shared WHOIS address or IP is a lead, not proof of
 ownership or responsibility. Review the full discovery path against authoritative inventory before

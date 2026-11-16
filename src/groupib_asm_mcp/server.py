@@ -14,7 +14,7 @@ from typing import Annotated, Any, Literal
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel, ConfigDict, Field, StrictBool
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool
 
 from groupib_asm_mcp.capping import MAX_RESULT_CHARS, MIN_RESULT_CHARS
 from groupib_asm_mcp.client import DEFAULT_BASE_URL, AsmClient, AsmError, path_segment
@@ -205,6 +205,34 @@ HasIssues = Literal["crit", "high", "medium", "low", "clean"]
 DateField = Literal["last_seen", "first_seen"]
 Order = Literal["asc", "desc"]
 
+
+def _as_filter_list(value: Any) -> Any:
+    """Normalize a filter parameter that should be a list.
+
+    Some MCP clients re-wrap a single-element array as an object (``{"item": "domain"}``) or
+    pass a bare string instead of a one-element array. Both are unambiguous for these
+    filters, so accept them rather than failing the whole call on a transport artifact.
+    The published JSON schema is unchanged (the validator runs before validation).
+    """
+    if value is None or isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        item = value.get("item")
+        if isinstance(item, str):
+            return [item]
+        if isinstance(item, list) and all(isinstance(entry, str) for entry in item):
+            return item
+    return value
+
+
+AssetStatusList = Annotated[list[AssetStatus] | None, BeforeValidator(_as_filter_list)]
+AssetTypeList = Annotated[list[AssetType] | None, BeforeValidator(_as_filter_list)]
+AssetDiscoverList = Annotated[list[AssetDiscover] | None, BeforeValidator(_as_filter_list)]
+HasIssuesList = Annotated[list[HasIssues] | None, BeforeValidator(_as_filter_list)]
+IssueStatusList = Annotated[list[IssueStatus] | None, BeforeValidator(_as_filter_list)]
+
 CompanyId = Annotated[str, Field(description="ASM company id (see list_companies)")]
 DateFrom = Annotated[str | None, Field(description="Start of the date window, as a date string")]
 DateTo = Annotated[str | None, Field(description="End of the date window, as a date string")]
@@ -326,7 +354,7 @@ def create_server(client: AsmClient) -> MCPServer:
         manual_severity: bool | None = None,
         cloud_issue: bool | None = None,
         asset_discovered: list[AssetDiscoveredBy] | None = None,
-        asset_status: list[AssetStatus] | None = None,
+        asset_status: AssetStatusList = None,
         count: Count = None,
         seq_update: Cursor = None,
         date_field: Annotated[
@@ -392,13 +420,13 @@ def create_server(client: AsmClient) -> MCPServer:
         company_id: CompanyId,
         date_from: DateFrom = None,
         date_to: DateTo = None,
-        type: list[AssetType] | None = None,  # noqa: A002 - mirrors the API field name
-        status: list[AssetStatus] | None = None,
+        type: AssetTypeList = None,  # noqa: A002 - mirrors the API field name
+        status: AssetStatusList = None,
         discover: Annotated[
-            list[AssetDiscover] | None, Field(description="How the asset was discovered")
+            AssetDiscoverList, Field(description="How the asset was discovered")
         ] = None,
         has_issues: Annotated[
-            list[HasIssues] | None,
+            HasIssuesList,
             Field(description="Highest issue severity on the asset, or 'clean' for none"),
         ] = None,
         filter_string: Annotated[str | None, Field(description="Free-text search string")] = None,
@@ -407,12 +435,17 @@ def create_server(client: AsmClient) -> MCPServer:
         date_field: DateField | None = None,
         order: Order | None = None,
     ) -> Any:
-        """List a company's discovered assets (domains, IPs, SSL certs, software, ...)."""
+        """List a company's discovered assets (domains, IPs, SSL certs, software, ...).
+
+        Defaults to a start date of 1970-01-01 because the API otherwise applies an implicit
+        recent date window, silently returning only the newest slice of the inventory.
+        Supply date_from to narrow the window. The API's date and retention limits still apply.
+        """
         return await client.post_paged(
             "/api/v1/assets/updated",
             {
                 "companyId": company_id,
-                "dateFrom": date_from,
+                "dateFrom": date_from if date_from is not None else "1970-01-01",
                 "dateTo": date_to,
                 "type": type,
                 "status": status,
@@ -448,17 +481,22 @@ def create_server(client: AsmClient) -> MCPServer:
         company_id: CompanyId,
         date_from: DateFrom = None,
         date_to: DateTo = None,
-        status: list[IssueStatus] | None = None,
+        status: IssueStatusList = None,
         count: Count = None,
         seq_update: Cursor = None,
         order: Order | None = None,
     ) -> Any:
-        """List a company's leak alerts (leaked credentials and data)."""
+        """List a company's leak alerts (leaked credentials and data).
+
+        Defaults to a start date of 1970-01-01 because the API otherwise applies an implicit
+        recent date window, silently returning only the newest slice of the leaks.
+        Supply date_from to narrow the window. The API's date and retention limits still apply.
+        """
         return await client.post_paged(
             "/api/v1/leaks/updated",
             {
                 "companyId": company_id,
-                "dateFrom": date_from,
+                "dateFrom": date_from if date_from is not None else "1970-01-01",
                 "dateTo": date_to,
                 "status": status,
                 "count": count,
