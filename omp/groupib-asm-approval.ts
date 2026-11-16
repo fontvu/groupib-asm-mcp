@@ -180,7 +180,7 @@ export default function groupibAsmApproval(pi: ExtensionAPI): void {
   pi.on("session_shutdown", () => {
     for (const controller of active) controller.abort();
   });
-  pi.on("mcp_notification", async (event, ctx) => {
+  pi.on("mcp_notification", (event, ctx) => {
     // Borrowed MCP connections fan notifications out to main and child sessions.
     if (!ctx.hasUI || ctx.agent?.kind !== "main") return;
     let approval: Approval | undefined;
@@ -202,25 +202,27 @@ export default function groupibAsmApproval(pi: ExtensionAPI): void {
     // Reserving the turn happens before awaiting; even cancelled waiters release
     // their slot only after their predecessors finish.
     // Release on every exit, including shutdown and dialog failures.
-    try {
-      await previousTurn;
-      if (!(await validSocket(approval.socket)) || controller.signal.aborted) return;
-      if (typeof ctx.ui.editor !== "function" || typeof ctx.ui.select !== "function") return;
-      const reviewed = await untilAborted(ctx.ui.editor(
-        "Group-IB ASM request: review all, then submit unchanged",
-        approval.preview,
-        { signal: controller.signal },
-      ), controller.signal);
-      if (reviewed !== approval.preview || controller.signal.aborted) return;
-      const answer = await choose(ctx, approval.requestId, controller.signal);
-      if (typeof answer !== "boolean" || controller.signal.aborted) return;
-      await sendAnswer(approval, answer, controller.signal);
-    } catch {
-      // Missing UI, cancellation, invalid requests and socket failures all fail closed.
-    } finally {
-      releaseTurn();
-      clearTimeout(timer);
-      active.delete(controller);
-    }
+    void (async () => {
+      try {
+        await previousTurn;
+        if (!(await validSocket(approval.socket)) || controller.signal.aborted) return;
+        if (typeof ctx.ui.editor !== "function" || typeof ctx.ui.select !== "function") return;
+        const reviewed = await untilAborted(ctx.ui.editor(
+          "Group-IB ASM request: review all, then submit unchanged",
+          approval.preview,
+          { signal: controller.signal },
+        ), controller.signal);
+        if (reviewed !== approval.preview || controller.signal.aborted) return;
+        const answer = await choose(ctx, approval.requestId, controller.signal);
+        if (typeof answer !== "boolean" || controller.signal.aborted) return;
+        await sendAnswer(approval, answer, controller.signal);
+      } catch {
+        // Missing UI, cancellation, invalid requests and socket failures all fail closed.
+      } finally {
+        releaseTurn();
+        clearTimeout(timer);
+        active.delete(controller);
+      }
+    })();
   });
 }

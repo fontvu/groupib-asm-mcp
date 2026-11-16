@@ -17,6 +17,8 @@ review followed by an **Approve once / Deny** question; both display the same re
 the whole request and submit it unchanged before answering. OMP must run interactively with an
 extension-capable UI; headless sessions fail closed. Approval expires after 60 seconds, including
 time spent waiting behind another request.
+The notification handler returns while the review runs, so OMP's handler timeout does not cut
+short the approval dialog. The review and response still expire under the deadline above.
 
 ## Getting started
 

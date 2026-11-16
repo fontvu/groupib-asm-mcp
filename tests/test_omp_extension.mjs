@@ -95,6 +95,27 @@ async function waitFor(predicate, message) {
   assert.fail(message);
 }
 
+test("notification handler returns while review remains open", async () => {
+  const request = await socketFixture("e".repeat(64), "slow-review");
+  const handlers = {};
+  extension({ on(name, handler) { handlers[name] = handler; } });
+  const ui = queuedUI();
+  const ctx = { hasUI: true, agent: { kind: "main" }, ui };
+  try {
+    const handler = handlers.mcp_notification(request.event, ctx);
+    const returned = await Promise.race([Promise.resolve(handler).then(() => true), delay(200, false)]);
+    assert.equal(returned, true, "notification handler waited for human review");
+    await waitFor(() => ui.current?.kind === "editor", "preview was not displayed");
+    ui.respond(ui.current.payload.prefill);
+    await waitFor(() => ui.current?.kind === "select", "decision was not displayed");
+    ui.respond("Approve once");
+    assert.deepEqual(await request.response, { token: request.event.params.data.token, approved: true });
+  } finally {
+    handlers.session_shutdown();
+    await request.close();
+  }
+});
+
 test("concurrent approvals keep each preview, decision and callback together", async () => {
   const one = await socketFixture("a".repeat(64), "company-A");
   const two = await socketFixture("b".repeat(64), "company-B");
