@@ -18,32 +18,38 @@ the whole request and submit it unchanged before answering. OMP must run interac
 extension-capable UI; headless sessions fail closed. Approval expires after 60 seconds, including
 time spent waiting behind another request.
 
-## Credentials
+## Getting started
 
-The API uses HTTP Basic auth: your **ASM login** (usually an email) as the username and the
-**API key** as the password. Both are required, and only ASM *Admin* users can use the API.
-Generate a key in ASM under **Help -> REST API & Integrations -> Generate API Key** (asks for
-your SSO password and shows the key once).
+### Prerequisites and installation
+
+You need Git, [uv](https://docs.astral.sh/uv/getting-started/installation/), Python 3.12 or
+newer, and a Group-IB ASM account with Admin API access.
+
+```sh
+git clone https://github.com/fontvu/groupib-asm-mcp.git
+cd groupib-asm-mcp
+uv sync
+```
+
+Generate an API key in ASM under **Help -> REST API & Integrations -> Generate API Key**.
+The server uses HTTP Basic authentication with your ASM login (usually an email) and API key.
+Export both in the shell that starts your agent; do not commit them or put them in shared config:
 
 ```sh
 export GIB_ASM_LOGIN='you@example.com'
-export GIB_ASM_API_KEY='...'          # never commit this
+export GIB_ASM_API_KEY='...'          # replace with your API key
 # optional: GIB_ASM_BASE_URL (default https://asm.group-ib.com)
 # optional: GIB_ASM_MAX_RESULT_CHARS (default 30000)
 ```
 
-The server refuses to start if either variable is missing.
+The server refuses to start if either credential is missing. To run it directly for an MCP
+client, use `uv run groupib-asm-mcp` from the checkout; it speaks MCP over stdio, not HTTP.
 
-## Run / register
+### Connect OMP
 
-```sh
-uv sync
-uv run groupib-asm-mcp          # speaks MCP over stdio
-```
-
-omp (`~/.omp/agent/mcp.json`) resolves the `env` entries below from its own environment, so
-the key never lands in the config file. Replace `/absolute/path/to/groupib-asm` with the path to
-your checkout:
+In `~/.omp/agent/mcp.json`, add this entry to the existing `mcpServers` object. Replace
+`/absolute/path/to/groupib-asm` with the actual checkout path. OMP resolves the `env` entries
+from its own environment, so export the variables before starting it:
 
 ```json
 "groupib-asm": {
@@ -55,10 +61,8 @@ your checkout:
 }
 ```
 
-Restart omp after exporting the variables.
-
-To install the OMP confirmation extension for the default profile, create a symlink to the
-checked-out extension and restart OMP (existing sessions do not load new extensions):
+Install the OMP confirmation extension for the default profile by creating a symlink to the
+checked-out extension:
 
 ```sh
 mkdir -p ~/.omp/agent/extensions
@@ -70,6 +74,43 @@ The extension and MCP server must run as the same local user and share a tempora
 do not use the bridge for a remote MCP server. It communicates the answer over a private,
 single-use local socket; it never sends credentials to OMP. If the extension or UI is absent,
 the write is refused after the approval deadline.
+
+Start or restart `omp`, then ask it to list the Group-IB companies. For example: “Use Group-IB
+ASM to list my companies.” If it cannot connect, check the exported credentials, checkout path,
+and OMP's MCP status. Writes additionally require the interactive approval extension above.
+
+### Connect Pi
+
+The following configuration is for Pi with its [built-in MCP support](https://docs.pi.dev/latest/mcp).
+In `~/.pi/agent/mcp.json`, add the entry below to the `mcpServers` object, replacing the checkout
+path. If the file does not exist, use the complete JSON shown. Pi expands `${...}` from its
+environment; do not substitute actual secrets into this file.
+
+```json
+{
+  "mcpServers": {
+    "groupib-asm": {
+      "command": "uv",
+      "args": ["run", "--quiet", "--project", "/absolute/path/to/groupib-asm", "groupib-asm-mcp"],
+      "env": {
+        "GIB_ASM_LOGIN": "${GIB_ASM_LOGIN}",
+        "GIB_ASM_API_KEY": "${GIB_ASM_API_KEY}"
+      },
+      "timeout": 90
+    }
+  }
+}
+```
+
+Run `pi mcp list` from the shell with the credentials exported, then start `pi` and ask it to
+list the Group-IB companies. In a running session, use `/reload` after changing the config and
+`/mcp` to inspect the connection. If a separate MCP adapter replaces Pi's built-in support,
+follow that adapter's configuration instructions instead.
+
+Read-only tools do not need the OMP extension. The OMP extension is **not** a Pi integration:
+write tools require a Pi MCP client that presents the server's form elicitation to a human.
+Pi write approval has not been verified here; if elicitation is unsupported or unavailable,
+writes fail closed. Never bypass the approval requirement.
 
 ## Tools
 
