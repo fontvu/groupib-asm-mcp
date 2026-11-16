@@ -336,16 +336,17 @@ def create_server(client: AsmClient) -> MCPServer:
     ) -> Any:
         """List a company's issues (findings), filtered and paged.
 
-        Unset filters mean "all". Each item's top-level `status` is the lifecycle state;
-        `body.status` is the severity label. The `status` filter only accepts its own lowercase
-        values; `solved` also matches items displayed as "Manually solved", and display values
-        such as "Manually solved" are rejected by the filter.
+        Defaults to a start date of 1970-01-01 because the API otherwise applies an implicit
+        recent date window. Supply date_from to narrow the window. The API's date and retention
+        limits still apply. Each item's top-level `status` is the lifecycle state; `body.status`
+        is the severity label. The `status` filter accepts lowercase values; `solved` also matches
+        items displayed as "Manually solved".
         """
         return await client.post_paged(
             "/api/v1/issues/updated",
             {
                 "companyId": company_id,
-                "dateFrom": date_from,
+                "dateFrom": date_from if date_from is not None else "1970-01-01",
                 "dateTo": date_to,
                 "category": category,
                 "testName": test_name,
